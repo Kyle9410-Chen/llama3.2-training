@@ -10,6 +10,7 @@ requires-python = ">=3.14"
 dependencies = [
     "datasets>=5.1.0",
     "numpy>=2.5.4",
+    "torch>=2.14.1",
     "transformers>=5.19.0",
     "wandb>=0.30.0",
 ]
