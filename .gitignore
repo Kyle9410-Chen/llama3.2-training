@@ -221,3 +221,13 @@ __marimo__/
 
 # Zed
 .zed
+
+# Logs
+logs
+
+# data
+data
+out
+
+# wandb
+wandb
