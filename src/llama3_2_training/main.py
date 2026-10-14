@@ -11,41 +11,52 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
 
+from llama3_2_training.distributed_muon import DistributedMuon
+from llama3_2_training.hub_retry import retry_on_rate_limit
 from llama3_2_training.scheduler import wsd_lr
 
 SEQ_LEN = 8192
 BOS_ID = 128000
 EOS_ID = 128001
+PAD_ID = 128004  # repack.py 用來補滿 sequence 的 <|finetune_right_pad_id|>
 TOKENIZER = "meta-llama/Llama-3.2-1B"
 
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", default="data")
+    p.add_argument("--train_file", default="train_packed_truncate.bin",
+                   help="training token file in data_dir, e.g. train_packed_truncate.bin from repack.py")
     p.add_argument("--out_dir", default="out")
     p.add_argument("--run_name", default="muon-baseline")
     p.add_argument("--wandb_project", default="lab5-training-llama")
     # deadline
     p.add_argument("--deadline", type=float,
-                   default=float(os.environ["TRAIN_DEADLINE"]) if "TRAIN_DEADLINE" in os.environ else None,
+                   default=float(os.environ["TRAIN_DEADLINE"]) if os.environ.get("TRAIN_DEADLINE") else None,
                    help="safety net: unix timestamp to stop early and save if max_tokens is not reached (usually the Slurm job end time)")
     p.add_argument("--time_budget_min", type=float, default=None,
                    help="minutes available from launch, used when --deadline is not given")
     p.add_argument("--save_reserve_min", type=float, default=5.0,
                    help="minutes reserved before the deadline for the final eval and model save")
     # token
-    p.add_argument("--max_tokens", type=float, default=6e9,
+    p.add_argument("--max_tokens", type=float, default=1e9,
                    help="training token budget; sets total steps, WSD schedule and eval interval")
-    p.add_argument("--micro_seqs", type=int, default=2,
+    p.add_argument("--micro_seqs", type=int, default=4,
                    help="number of 8192-token sequences per GPU per micro-step")
     # optimizer
     p.add_argument("--optimizer", choices=["muon", "adamw"], default="muon",
                    help="muon: Muon for hidden 2D weights + AdamW for embeddings/norms; "
                         "adamw: AdamW for everything")
-    p.add_argument("--lr", type=float, default=4e-4,
+    p.add_argument("--lr", type=float, default=1.2e-3,
                    help="peak LR, shared by Muon (RMS-matched to AdamW) and AdamW")
-    p.add_argument("--min_lr_ratio", type=float, default=0.1)
-    p.add_argument("--warmup_steps", type=int, default=500)
-    p.add_argument("--decay_ratio", type=float, default=0.1,
+    p.add_argument("--min_lr_ratio", type=float, default=0.0,
+                   help="final LR as a fraction of peak at the end of WSD decay (0 = decay to zero)")
+    p.add_argument("--warmup_steps", type=int, default=200)
+    p.add_argument("--warmup_tokens", type=float, default=None,
+                   help="if set, overrides --warmup_steps with round(warmup_tokens / tokens_per_step)")
+    p.add_argument("--lr_ref_batch", type=int, default=None,
+                   help="if set, --lr is the peak LR at this global batch (tokens) and is scaled by "
+                        "sqrt(tokens_per_step / lr_ref_batch)")
+    p.add_argument("--decay_ratio", type=float, default=0.2,
                    help="fraction of total steps (at the end) used for LR decay in WSD")
     p.add_argument("--decay_shape", choices=["linear", "sqrt", "cosine"], default="linear",
                    help="shape of the WSD decay phase (sqrt = 1 - sqrt(progress))")
@@ -55,18 +66,24 @@ def get_args():
     p.add_argument("--eps", type=float, default=1e-8)
     p.add_argument("--muon_momentum", type=float, default=0.95)
     p.add_argument("--muon_ns_steps", type=int, default=5)
+    p.add_argument("--distributed_muon", action=argparse.BooleanOptionalAction, default=True,
+                   help="split Muon's Newton-Schulz work across ranks instead of repeating it on every rank")
+    p.add_argument("--attn_impl", default="kernels-community/flash-attn3",
+                   help="attention kernel; must be a flash-attn varlen kernel so packed docs stay isolated")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile the model (first steps are slower while compiling)")
     p.add_argument("--grad_clip", type=float, default=1.0)
     # logging / eval / ckpt
     p.add_argument("--logging_steps", type=int, default=10)
-    p.add_argument("--eval_interval", type=float, default=0.05,
+    p.add_argument("--eval_interval", type=float, default=0.1,
                    help="run eval every this fraction of total steps (spec requires <= 0.1)")
-    p.add_argument("--eval_docs", type=int, default=10000)
-    p.add_argument("--save_every", type=int, default=1000)
+    p.add_argument("--eval_docs", type=int, default=2000)
+    p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--push_to_hub", default=None, help="e.g. your-name/llama1b-adamw")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
-def build_model():
+def build_model(attn_impl="kernels-community/flash-attn3"):
     config = LlamaConfig(
         vocab_size=128256,
         hidden_size=2048,
@@ -88,7 +105,7 @@ def build_model():
         use_cache=False,
     )
 
-    return AutoModelForCausalLM.from_config(config, attn_implementation="kernels-community/flash-attn2")
+    return AutoModelForCausalLM.from_config(config, attn_implementation=attn_impl)
 
 
 def make_position_ids(x, seq_len=None):
@@ -106,6 +123,7 @@ def make_inputs(x, seq_len=None):
     pos = make_position_ids(x, seq_len)
     labels = x.clone()
     labels[pos == 0] = -100
+    labels[x == PAD_ID] = -100  # packed 資料的 padding 不算 loss
     return x[None], pos[None], labels[None]
 
 
@@ -177,16 +195,25 @@ class MultiOptimizer:
         for o in self.opts:
             o.zero_grad(set_to_none=set_to_none)
 
+    # 一般 optimizer 的 state 每個 rank 都一樣，由 rank 0 存在 ckpt.pt；
+    # sharded（DistributedMuon）的 state 每個 rank 不同，各自存一份
     def state_dict(self):
-        return [o.state_dict() for o in self.opts]
+        return [None if getattr(o, "sharded", False) else o.state_dict() for o in self.opts]
 
-    def load_state_dict(self, states):
+    def shard_state_dict(self):
+        return [o.state_dict() if getattr(o, "sharded", False) else None for o in self.opts]
+
+    def load_state_dict(self, states, shard_states=None):
         assert len(states) == len(self.opts), "checkpoint optimizer layout does not match"
-        for o, sd in zip(self.opts, states):
-            o.load_state_dict(sd)
+        for i, o in enumerate(self.opts):
+            if getattr(o, "sharded", False):
+                assert shard_states is not None, "missing sharded optimizer state for this rank"
+                o.load_state_dict(shard_states[i])
+            else:
+                o.load_state_dict(states[i])
 
 
-def build_optimizer(model, args):
+def build_optimizer(model, args, rank=0, world=1):
     # Muon 只用在 transformer block 內的 2D 權重；embedding（與 tied lm_head）與 norm 用 AdamW
     muon, decay, no_decay = [], [], []
     for name, p in model.named_parameters():
@@ -204,9 +231,12 @@ def build_optimizer(model, args):
         lr=args.lr, betas=(args.beta1, args.beta2), eps=args.eps, fused=True)
     if not muon:
         return MultiOptimizer(adamw)
-    muon_opt = torch.optim.Muon(muon, lr=args.lr, weight_decay=args.weight_decay,
-                                momentum=args.muon_momentum, nesterov=True,
-                                ns_steps=args.muon_ns_steps, adjust_lr_fn="match_rms_adamw")
+    muon_kwargs = dict(lr=args.lr, weight_decay=args.weight_decay, momentum=args.muon_momentum,
+                       nesterov=True, ns_steps=args.muon_ns_steps, adjust_lr_fn="match_rms_adamw")
+    if args.distributed_muon and world > 1:
+        muon_opt = DistributedMuon(muon, rank, world, **muon_kwargs)
+    else:
+        muon_opt = torch.optim.Muon(muon, **muon_kwargs)
     return MultiOptimizer(muon_opt, adamw)
 
 
@@ -230,6 +260,10 @@ def save_final(raw_model, args, tokens_seen, step):
 def main():
     t_launch = time.time()
     args = get_args()
+    # 由 wandb sweep agent 啟動時，所有 rank 都拿得到同一個 WANDB_RUN_ID；
+    # 加進 run_name 讓每個 sweep run 有獨立的 out 目錄（否則會互相 resume ckpt）
+    if os.environ.get("WANDB_SWEEP_ID") and os.environ.get("WANDB_RUN_ID"):
+        args.run_name = f"{args.run_name}-{os.environ['WANDB_RUN_ID']}"
     # deadline 只是安全網：token 用完前時間就到的話，提早停下並存模型
     if args.deadline is not None:
         deadline = args.deadline
@@ -252,26 +286,37 @@ def main():
     micro_tokens = args.micro_seqs * SEQ_LEN
     tokens_per_step = micro_tokens * world
 
-    train_data = TrainData(f"{args.data_dir}/train.bin", micro_tokens, rank, world)
+    train_data = TrainData(f"{args.data_dir}/{args.train_file}", micro_tokens, rank, world)
     max_steps = int(min(args.max_tokens, len(train_data)) // tokens_per_step)
+    # batch sweep 用：lr 依 sqrt(batch) 從參考 batch 換算、warmup 以 token 數指定，讓不同 batch 可以用同一組 grid
+    # 換算後覆寫 args；但 sweep 的參數在 wandb config 會鎖定成 sweep 給的值，所以實際 lr 另外記成 peak_lr
+    args.lr_ref = args.lr
+    if args.lr_ref_batch:
+        args.lr = args.lr * math.sqrt(tokens_per_step / args.lr_ref_batch)
+    if args.warmup_tokens:
+        args.warmup_steps = max(1, round(args.warmup_tokens / tokens_per_step))
     eval_rows = build_eval_rows(args.data_dir, args.eval_docs, micro_tokens)[rank::world]
 
-    model = build_model().to(device)
+    model = retry_on_rate_limit(lambda: build_model(args.attn_impl), log=lambda m: print(f"[rank {rank}] {m}", flush=True)).to(device)
     raw_model = model
-    opt = build_optimizer(raw_model, args)
+    opt = build_optimizer(raw_model, args, rank, world)
 
     start_step, tokens_seen = 0, 0
     ckpt_path = os.path.join(args.out_dir, args.run_name, "ckpt.pt")
+    shard_path = os.path.join(args.out_dir, args.run_name, f"opt-rank{rank}.pt")
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         raw_model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
+        shard = torch.load(shard_path, map_location="cpu") if os.path.exists(shard_path) else None
+        opt.load_state_dict(ckpt["opt"], shard)
         start_step, tokens_seen = ckpt["step"], ckpt["tokens_seen"]
         if is_main:
             print(f"resumed from step {start_step}")
         del ckpt
 
     model = DDP(model, device_ids=[local_rank])
+    if args.compile:
+        model = torch.compile(model)
 
     if is_main:
         import wandb
@@ -280,7 +325,7 @@ def main():
         wandb_dir = tempfile.mkdtemp(prefix="wandb-")
         wandb.init(project=args.wandb_project, name=args.run_name, dir=wandb_dir,
                    config={**vars(args), "world_size": world,
-                           "tokens_per_step": tokens_per_step,
+                           "tokens_per_step": tokens_per_step, "peak_lr": args.lr,
                            "max_steps": max_steps, "n_params": n_params},
                    resume="allow")
 
@@ -294,7 +339,7 @@ def main():
         limit = "no time limit" if math.isinf(budget) else f"time limit {budget/60:.1f} min"
         print(f"params {n_params/1e9:.3f}B | tokens/step {tokens_per_step:,} | "
               f"max steps {max_steps:,} ({max_steps * tokens_per_step:,} tokens) | {limit} | "
-              f"eval every {eval_every} steps", flush=True)
+              f"eval every {eval_every} steps | peak lr {args.lr:.3e} | warmup {args.warmup_steps} steps", flush=True)
 
     model.train()
     window_loss, window_n = 0.0, 0
@@ -363,11 +408,15 @@ def main():
                           step=step)
                 print(f"[eval] step {step} | ppl {ppl:.3f}", flush=True)
 
-        if step % args.save_every == 0 and is_main:
+        if step % args.save_every == 0:
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            torch.save({"model": raw_model.state_dict(), "opt": opt.state_dict(),
-                        "step": step, "tokens_seen": tokens_seen}, ckpt_path + ".tmp")
-            os.replace(ckpt_path + ".tmp", ckpt_path)
+            if any(s is not None for s in opt.shard_state_dict()):
+                torch.save(opt.shard_state_dict(), shard_path + ".tmp")
+                os.replace(shard_path + ".tmp", shard_path)
+            if is_main:
+                torch.save({"model": raw_model.state_dict(), "opt": opt.state_dict(),
+                            "step": step, "tokens_seen": tokens_seen}, ckpt_path + ".tmp")
+                os.replace(ckpt_path + ".tmp", ckpt_path)
 
     if is_main:
         print(f"stopped at step {step} ({stop_reason}) | {tokens_seen:,} tokens | "

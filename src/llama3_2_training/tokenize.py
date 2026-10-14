@@ -13,7 +13,8 @@ OUT_DIR = "data"
 SEED = 42
 N_EVAL = 50_000
 EVAL_KEEP = 10_000
-TRAIN_TOKENS = 6_200_000_000
+TRAIN_TOKENS = int(float(os.environ.get("TRAIN_TOKENS", 8e9)))
+TRAIN_OUT = os.environ.get("TRAIN_OUT", "train.bin")
 CHUNK_DOCS = 500_000
 NUM_PROC = int(os.environ.get("NUM_PROC", 64))
 
@@ -54,11 +55,15 @@ def main():
             arrs.append(np.asarray(x, dtype=np.uint32))
             lens.append(len(x))
     offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
-    np.concatenate(arrs).tofile(f"{OUT_DIR}/eval.bin")
-    np.save(f"{OUT_DIR}/eval_offsets.npy", offsets)
+    # 先寫暫存檔再 rename，正在讀舊檔的 job 不受影響，中途失敗也不會留下半個檔
+    np.concatenate(arrs).tofile(f"{OUT_DIR}/eval.bin.tmp")
+    os.replace(f"{OUT_DIR}/eval.bin.tmp", f"{OUT_DIR}/eval.bin")
+    np.save(f"{OUT_DIR}/eval_offsets.tmp.npy", offsets)
+    os.replace(f"{OUT_DIR}/eval_offsets.tmp.npy", f"{OUT_DIR}/eval_offsets.npy")
     print(f"eval: {EVAL_KEEP:,} docs, {offsets[-1]:,} tokens")
 
-    out = np.memmap(f"{OUT_DIR}/train.bin", dtype=np.uint32, mode="w+",
+    out_path = f"{OUT_DIR}/{TRAIN_OUT}"
+    out = np.memmap(out_path + ".tmp", dtype=np.uint32, mode="w+",
                     shape=(TRAIN_TOKENS,))
     pos, start, n_docs = 0, 0, 0
     while pos < TRAIN_TOKENS and start < len(train):
@@ -75,6 +80,8 @@ def main():
         print(f"train: docs [{start:,}, {end:,}) -> {pos:,} / {TRAIN_TOKENS:,} tokens")
         start = end
     out.flush()
+    del out
+    os.replace(out_path + ".tmp", out_path)
 
     with open(f"{OUT_DIR}/meta.json", "w") as f:
         json.dump({
